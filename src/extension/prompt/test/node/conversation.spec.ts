@@ -24,14 +24,14 @@ describe('Turn', () => {
 			expect(turn.responseChatResult === result);
 		});
 
-		it('should throw an error if setResponse is called more than once', () => {
+		it('should NOT throw an error if setResponse is called more than once', () => {
 			const request: TurnMessage = { type: 'user', message: 'Hello' };
 			const turn = new Turn('1', request, new ChatVariablesCollection([]));
 
 			const response: TurnMessage = { type: 'model', message: 'Hi there!' };
 			turn.setResponse(TurnStatus.Success, response, undefined, undefined);
 
-			expect(() => turn.setResponse(TurnStatus.Success, response, undefined, undefined)).to.throw();
+			expect(() => turn.setResponse(TurnStatus.Success, response, undefined, undefined)).to.not.throw();
 		});
 
 		it('should default status to InProgress if not set', () => {

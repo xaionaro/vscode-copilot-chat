@@ -161,7 +161,6 @@ export class Turn {
 			return;
 		}
 
-		assertType(!this._responseInfo);
 		this._responseInfo = { message, status, responseId, chatResult };
 	}
 

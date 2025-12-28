@@ -42,12 +42,19 @@ export class ToolCallCancelledError extends Error {
 
 export interface IOnWillInvokeToolEvent {
 	toolName: string;
+	chatRequestId?: string;
+}
+
+export interface IOnDidInvokeToolEvent {
+	toolName: string;
+	chatRequestId?: string;
 }
 
 export interface IToolsService {
 	readonly _serviceBrand: undefined;
 
 	onWillInvokeTool: Event<IOnWillInvokeToolEvent>;
+	onDidInvokeTool: Event<IOnDidInvokeToolEvent>;
 
 	/**
 	 * All registered LanguageModelToolInformations (vscode.lm.tools)
@@ -157,6 +164,9 @@ export abstract class BaseToolsService extends Disposable implements IToolsServi
 
 	protected readonly _onWillInvokeTool = this._register(new Emitter<IOnWillInvokeToolEvent>());
 	public get onWillInvokeTool() { return this._onWillInvokeTool.event; }
+
+	protected readonly _onDidInvokeTool = this._register(new Emitter<IOnDidInvokeToolEvent>());
+	public get onDidInvokeTool() { return this._onDidInvokeTool.event; }
 
 	abstract tools: ReadonlyArray<vscode.LanguageModelToolInformation>;
 	abstract copilotTools: ReadonlyMap<ToolName, ICopilotTool<unknown>>;

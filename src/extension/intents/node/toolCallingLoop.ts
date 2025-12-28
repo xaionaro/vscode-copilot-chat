@@ -98,8 +98,14 @@ export abstract class ToolCallingLoop<TOptions extends IToolCallingLoopOptions =
 	private toolCallResults: Record<string, LanguageModelToolResult2> = Object.create(null);
 	private toolCallRounds: IToolCallRound[] = [];
 
+	private readonly _onWillBuildPrompt = this._register(new Emitter<void>());
+	public readonly onWillBuildPrompt = this._onWillBuildPrompt.event;
+
 	private readonly _onDidBuildPrompt = this._register(new Emitter<{ result: IBuildPromptResult; tools: LanguageModelToolInformation[]; promptTokenLength: number }>());
 	public readonly onDidBuildPrompt = this._onDidBuildPrompt.event;
+
+	private readonly _onWillFetch = this._register(new Emitter<void>());
+	public readonly onWillFetch = this._onWillFetch.event;
 
 	private readonly _onDidReceiveResponse = this._register(new Emitter<IToolCallingResponseEvent>());
 	public readonly onDidReceiveResponse = this._onDidReceiveResponse.event;
@@ -342,6 +348,7 @@ export abstract class ToolCallingLoop<TOptions extends IToolCallingLoopOptions =
 
 	/** Runs a single iteration of the tool calling loop. */
 	public async runOne(outputStream: ChatResponseStream | undefined, iterationNumber: number, token: CancellationToken | PauseController): Promise<IToolCallSingleResult> {
+		this._onWillBuildPrompt.fire();
 		let availableTools = await this.getAvailableTools(outputStream, token);
 		const context = this.createPromptContext(availableTools, outputStream);
 		const isContinuation = context.isContinuation || false;
@@ -437,6 +444,7 @@ export abstract class ToolCallingLoop<TOptions extends IToolCallingLoopOptions =
 		let thinkingItem: ThinkingDataItem | undefined;
 		const endpoint = await this._endpointProvider.getChatEndpoint(this.options.request);
 		const disableThinking = isContinuation && isAnthropicFamily(endpoint) && !ToolCallingLoop.messagesContainThinking(buildPromptResult.messages);
+		this._onWillFetch.fire();
 		const fetchResult = await this.fetch({
 			messages: this.applyMessagePostProcessing(buildPromptResult.messages),
 			finishedCb: async (text, index, delta) => {

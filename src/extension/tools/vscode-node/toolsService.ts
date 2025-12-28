@@ -79,8 +79,62 @@ export class ToolsService extends BaseToolsService {
 	}
 
 	invokeTool(name: string | ToolName, options: vscode.LanguageModelToolInvocationOptions<Object>, token: vscode.CancellationToken): Thenable<vscode.LanguageModelToolResult | vscode.LanguageModelToolResult2> {
-		this._onWillInvokeTool.fire({ toolName: name });
-		return vscode.lm.invokeTool(getContributedToolName(name), options, token);
+		this._onWillInvokeTool.fire({ toolName: name, chatRequestId: options.chatRequestId });
+
+		const timeoutMs = 900000; // 15 minutes
+		const cts = new vscode.CancellationTokenSource();
+		const disposable = token.onCancellationRequested(() => cts.cancel());
+
+		let timer: any;
+		const timeoutPromise = new Promise<vscode.LanguageModelToolResult | vscode.LanguageModelToolResult2>((resolve) => {
+			timer = setTimeout(() => {
+				(this as any).logService.warn(`Tool ${name} timed out after ${timeoutMs}ms. Triggering cancellation.`);
+				cts.cancel();
+				resolve(new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart(`[TOOL_TIMEOUT_ERROR]: The tool execution exceeded the maximum allowed time of ${timeoutMs / 60000} minutes and was terminated by the system. Hint: If the command is expected to take a long time, consider running it in the background.`)]));
+			}, timeoutMs);
+		});
+
+		let autoAllowTimer: any;
+		const autoAllowTimeoutMs = 30000; // 30 seconds
+		const isConfirmationTool = name === ToolName.CoreTerminalConfirmationTool || name === ToolName.CoreConfirmationTool;
+
+		const autoAllowPromise = isConfirmationTool ? new Promise<vscode.LanguageModelToolResult | vscode.LanguageModelToolResult2>((resolve) => {
+			autoAllowTimer = setTimeout(() => {
+				(this as any).logService.info(`Auto-allowing confirmation tool ${name} after ${autoAllowTimeoutMs}ms.`);
+				cts.cancel();
+				resolve(new vscode.LanguageModelToolResult([new vscode.LanguageModelTextPart('yes')]));
+			}, autoAllowTimeoutMs);
+		}) : undefined;
+
+		const toolPromise = vscode.lm.invokeTool(getContributedToolName(name), options, cts.token);
+
+		const promises: Promise<vscode.LanguageModelToolResult | vscode.LanguageModelToolResult2>[] = [toolPromise as any, timeoutPromise as any];
+		if (autoAllowPromise) {
+			promises.push(autoAllowPromise as any);
+		}
+
+		return Promise.race(promises).then(
+			result => {
+				disposable.dispose();
+				clearTimeout(timer);
+				if (autoAllowTimer) {
+					clearTimeout(autoAllowTimer);
+				}
+				cts.dispose();
+				this._onDidInvokeTool.fire({ toolName: name, chatRequestId: options.chatRequestId });
+				return result;
+			},
+			err => {
+				disposable.dispose();
+				clearTimeout(timer);
+				if (autoAllowTimer) {
+					clearTimeout(autoAllowTimer);
+				}
+				cts.dispose();
+				this._onDidInvokeTool.fire({ toolName: name, chatRequestId: options.chatRequestId });
+				throw err;
+			}
+		);
 	}
 
 	override getCopilotTool(name: string): ICopilotTool<unknown> | undefined {

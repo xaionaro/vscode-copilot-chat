@@ -4,11 +4,13 @@
  *--------------------------------------------------------------------------------------------*/
 
 import * as l10n from '@vscode/l10n';
+import * as vscode from 'vscode';
 import { Raw } from '@vscode/prompt-tsx';
 import type { ChatRequest, ChatResponseReferencePart, ChatResponseStream, ChatResult, LanguageModelToolInformation, Progress } from 'vscode';
 import { IAuthenticationService } from '../../../platform/authentication/common/authentication';
 import { IAuthenticationChatUpgradeService } from '../../../platform/authentication/common/authenticationUpgrade';
 import { ICopilotTokenStore } from '../../../platform/authentication/common/copilotTokenStore';
+import { IToolsService } from '../../tools/common/toolsService';
 import { CanceledResult, ChatFetchResponseType, ChatLocation, ChatResponse, getErrorDetailsFromChatFetchError } from '../../../platform/chat/common/commonTypes';
 import { IConversationOptions } from '../../../platform/chat/common/conversationOptions';
 import { IEditSurvivalTrackerService, IEditSurvivalTrackingSession, NullEditSurvivalTrackingSession } from '../../../platform/editSurvivalTracking/common/editSurvivalTrackerService';
@@ -23,6 +25,7 @@ import { ISurveyService } from '../../../platform/survey/common/surveyService';
 import { IExperimentationService } from '../../../platform/telemetry/common/nullExperimentationService';
 import { ITelemetryService } from '../../../platform/telemetry/common/telemetry';
 import { ChatResponseStreamImpl } from '../../../util/common/chatResponseStreamImpl';
+import { DeferredPromise, timeout } from '../../../util/vs/base/common/async';
 import { CancellationToken } from '../../../util/vs/base/common/cancellation';
 import { isCancellationError } from '../../../util/vs/base/common/errors';
 import { Event } from '../../../util/vs/base/common/event';
@@ -69,10 +72,34 @@ export interface IDefaultIntentRequestHandlerOptions {
 */
 export class DefaultIntentRequestHandler {
 
+	private static retryPromises = new Map<string, DeferredPromise<void>>();
+	private static commandRegistered = false;
+
+	private registerRetryCommand() {
+		if (DefaultIntentRequestHandler.commandRegistered) {
+			return;
+		}
+		DefaultIntentRequestHandler.commandRegistered = true;
+		vscode.commands.registerCommand('github.copilot.chat.retryNow', (requestId: string) => {
+			this._logService.info(`[RetryCommand] Received retry request for ${requestId}`);
+			const deferred = DefaultIntentRequestHandler.retryPromises.get(requestId);
+			if (deferred) {
+				this._logService.info(`[RetryCommand] Found deferred promise for ${requestId}, completing...`);
+				DefaultIntentRequestHandler.retryPromises.delete(requestId);
+				deferred.complete();
+			} else {
+				this._logService.warn(`[RetryCommand] No deferred promise found for ${requestId}. Available IDs: ${Array.from(DefaultIntentRequestHandler.retryPromises.keys()).join(', ')}`);
+			}
+		});
+	}
+
 	private readonly turn: Turn;
 
 	private _editSurvivalTracker: IEditSurvivalTrackingSession = new NullEditSurvivalTrackingSession();
 	private _loop!: DefaultToolCallingLoop;
+	private _currentContextUsage: string | undefined;
+	private _currentStatus: string | undefined;
+	private _statusBarItem: vscode.StatusBarItem | undefined;
 
 	constructor(
 		private readonly intent: IIntent,
@@ -94,77 +121,170 @@ export class DefaultIntentRequestHandler {
 		@IEditSurvivalTrackerService private readonly _editSurvivalTrackerService: IEditSurvivalTrackerService,
 		@IAuthenticationService private readonly _authenticationService: IAuthenticationService,
 		@IEndpointProvider private readonly _endpointProvider: IEndpointProvider,
+		@IToolsService private readonly _toolsService: IToolsService,
 	) {
 		// Initialize properties
 		this.turn = conversation.getLatestTurn();
+		this.registerRetryCommand();
+	}
+
+	private updateStatusBar(text?: string) {
+		if (text !== undefined) {
+			this._currentContextUsage = text;
+		}
+		if (!this._statusBarItem) {
+			this._statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+		}
+		const parts = [];
+		if (this._currentContextUsage) {
+			parts.push(this._currentContextUsage);
+		}
+		if (this._currentStatus) {
+			parts.push(this._currentStatus);
+		}
+		this._statusBarItem.text = `$(graph) ${parts.join(' | ')}`;
+		this._statusBarItem.tooltip = l10n.t('Copilot Status');
+		this._statusBarItem.show();
 	}
 
 	async getResult(): Promise<ChatResult> {
-		if (isToolCallLimitCancellation(this.request)) {
+		try {
+			if (isToolCallLimitCancellation(this.request)) {
 			// Just some friendly text instead of an empty message on cancellation:
 			this.stream.markdown(l10n.t("Let me know if there's anything else I can help with!"));
 			return {};
 		}
 
-		try {
-			if (this.token.isCancellationRequested) {
-				return CanceledResult;
+		let attempts = 0;
+		while (true) {
+			try {
+				if (this.token.isCancellationRequested) {
+					return CanceledResult;
+				}
+
+				this._logService.trace('Processing intent');
+				const intentInvocation = await this.intent.invoke({ location: this.location, documentContext: this.documentContext, request: this.request });
+				if (this.token.isCancellationRequested) {
+					return CanceledResult;
+				}
+				this._logService.trace('Processed intent');
+
+				this.turn.setMetadata(new IntentInvocationMetadata(intentInvocation));
+
+				const confirmationResult = await this.handleConfirmationsIfNeeded();
+				if (confirmationResult) {
+					return confirmationResult;
+				}
+
+				const resultDetails = await this._requestLogger.captureInvocation(new CapturingToken(this.request.prompt, 'comment', false), () => this.runWithToolCalling(intentInvocation));
+
+				let chatResult = resultDetails.chatResult || {};
+				this._surveyService.signalUsage(`${this.location === ChatLocation.Editor ? 'inline' : 'panel'}.${this.intent.id}`, this.documentContext?.document.languageId);
+
+				const responseMessage = resultDetails.toolCallRounds.at(-1)?.response ?? '';
+				const metadataFragment: Partial<IResultMetadata> = {
+					toolCallRounds: resultDetails.toolCallRounds,
+					toolCallResults: this._collectRelevantToolCallResults(resultDetails.toolCallRounds, resultDetails.toolCallResults),
+				};
+				mixin(chatResult, { metadata: metadataFragment }, true);
+				const baseModelTelemetry = createTelemetryWithId();
+				chatResult = await this.processResult(resultDetails.response, responseMessage, chatResult, metadataFragment, baseModelTelemetry, resultDetails.toolCallRounds);
+
+				const errorDetails = chatResult.errorDetails;
+				if (errorDetails && !this.token.isCancellationRequested && attempts < 10) {
+					const errorMsg = errorDetails.message || '';
+					const isRateLimited = errorDetails.isRateLimited ||
+						errorDetails.isQuotaExceeded ||
+						errorDetails.code === 'rateLimited' ||
+						errorDetails.code === 'quotaExceeded' ||
+						errorMsg.toLowerCase().includes('rate-limited') ||
+						errorMsg.toLowerCase().includes('exceeded your copilot token usage');
+
+					const isFailed = errorDetails.code === ChatFetchResponseType.Failed ||
+						errorDetails.code === ChatFetchResponseType.BadRequest ||
+						errorDetails.code === ChatFetchResponseType.NetworkError ||
+						errorMsg.toLowerCase().includes('request failed');
+
+					if (isRateLimited || isFailed) {
+						const retryDelaySeconds = isRateLimited ? 1800 : 5;
+						this.stream.markdown(errorMsg);
+
+						const retryPromise = new DeferredPromise<void>();
+						DefaultIntentRequestHandler.retryPromises.set(this.turn.id, retryPromise);
+
+						try {
+							this.stream.button({
+								command: 'github.copilot.chat.retryNow',
+								title: l10n.t('Try Again Now'),
+								arguments: [this.turn.id]
+							});
+
+							for (let i = retryDelaySeconds; i > 0; i--) {
+								if (this.token.isCancellationRequested || retryPromise.isSettled) {
+									break;
+								}
+
+								this._currentStatus = l10n.t('retrying in {0}s', i);
+								this.updateStatusBar();
+
+								await Promise.race([
+									timeout(1000, this.token),
+									retryPromise.p
+								]);
+							}
+
+							if (retryPromise.isResolved) {
+								this._currentStatus = l10n.t('retrying now...');
+								this.updateStatusBar();
+							}
+						} finally {
+							this._currentStatus = undefined;
+							this.updateStatusBar();
+							DefaultIntentRequestHandler.retryPromises.delete(this.turn.id);
+							// Clear the retry message and button from the UI by setting the response to just the error message
+							this.turn.setResponse(TurnStatus.Error, { message: errorMsg, type: 'meta' }, undefined, undefined);
+						}
+
+						if (!this.token.isCancellationRequested) {
+							attempts++;
+							this.turn.setResponse(TurnStatus.InProgress, { message: '', type: 'meta' }, undefined, undefined);
+							continue;
+						}
+					}
+				}
+
+				if (chatResult.errorDetails && intentInvocation.modifyErrorDetails) {
+					chatResult.errorDetails = intentInvocation.modifyErrorDetails(chatResult.errorDetails, resultDetails.response);
+				}
+
+				if (resultDetails.hadIgnoredFiles) {
+					this.stream.markdown(HAS_IGNORED_FILES_MESSAGE);
+				}
+
+				return chatResult;
+			} catch (err) {
+				if (err instanceof ToolCallCancelledError) {
+					this.turn.setResponse(TurnStatus.Cancelled, { message: err.message, type: 'meta' }, undefined, {});
+					return {};
+				} else if (isCancellationError(err)) {
+					return CanceledResult;
+				} else if (err instanceof EmptyPromptError) {
+					return {};
+				}
+
+				this._logService.error(err);
+				this._telemetryService.sendGHTelemetryException(err, 'Error');
+				const errorMessage = (<Error>err).message;
+				const chatResult = { errorDetails: { message: errorMessage } };
+				this.turn.setResponse(TurnStatus.Error, { message: errorMessage, type: 'meta' }, undefined, chatResult);
+				return chatResult;
 			}
-
-			this._logService.trace('Processing intent');
-			const intentInvocation = await this.intent.invoke({ location: this.location, documentContext: this.documentContext, request: this.request });
-			if (this.token.isCancellationRequested) {
-				return CanceledResult;
-			}
-			this._logService.trace('Processed intent');
-
-			this.turn.setMetadata(new IntentInvocationMetadata(intentInvocation));
-
-			const confirmationResult = await this.handleConfirmationsIfNeeded();
-			if (confirmationResult) {
-				return confirmationResult;
-			}
-
-			const resultDetails = await this._requestLogger.captureInvocation(new CapturingToken(this.request.prompt, 'comment', false), () => this.runWithToolCalling(intentInvocation));
-
-			let chatResult = resultDetails.chatResult || {};
-			this._surveyService.signalUsage(`${this.location === ChatLocation.Editor ? 'inline' : 'panel'}.${this.intent.id}`, this.documentContext?.document.languageId);
-
-			const responseMessage = resultDetails.toolCallRounds.at(-1)?.response ?? '';
-			const metadataFragment: Partial<IResultMetadata> = {
-				toolCallRounds: resultDetails.toolCallRounds,
-				toolCallResults: this._collectRelevantToolCallResults(resultDetails.toolCallRounds, resultDetails.toolCallResults),
-			};
-			mixin(chatResult, { metadata: metadataFragment }, true);
-			const baseModelTelemetry = createTelemetryWithId();
-			chatResult = await this.processResult(resultDetails.response, responseMessage, chatResult, metadataFragment, baseModelTelemetry, resultDetails.toolCallRounds);
-			if (chatResult.errorDetails && intentInvocation.modifyErrorDetails) {
-				chatResult.errorDetails = intentInvocation.modifyErrorDetails(chatResult.errorDetails, resultDetails.response);
-			}
-
-			if (resultDetails.hadIgnoredFiles) {
-				this.stream.markdown(HAS_IGNORED_FILES_MESSAGE);
-			}
-
-			return chatResult;
-		} catch (err) {
-			if (err instanceof ToolCallCancelledError) {
-				this.turn.setResponse(TurnStatus.Cancelled, { message: err.message, type: 'meta' }, undefined, {});
-				return {};
-			} else if (isCancellationError(err)) {
-				return CanceledResult;
-			} else if (err instanceof EmptyPromptError) {
-				return {};
-			}
-
-			this._logService.error(err);
-			this._telemetryService.sendGHTelemetryException(err, 'Error');
-			const errorMessage = (<Error>err).message;
-			const chatResult = { errorDetails: { message: errorMessage } };
-			this.turn.setResponse(TurnStatus.Error, { message: errorMessage, type: 'meta' }, undefined, chatResult);
-			return chatResult;
 		}
+	} finally {
+		this._statusBarItem?.dispose();
+		this._statusBarItem = undefined;
 	}
+}
 
 	private _collectRelevantToolCallResults(toolCallRounds: IToolCallRound[], toolCallResults: Record<string, LanguageModelToolResult2>): Record<string, LanguageModelToolResult2> | undefined {
 		const resultsUsedInThisTurn: Record<string, LanguageModelToolResult2> = {};
@@ -287,6 +407,33 @@ export class DefaultIntentRequestHandler {
 
 	private async runWithToolCalling(intentInvocation: IIntentInvocation): Promise<IInternalRequestResult> {
 		const store = new DisposableStore();
+		const participants = this.makeResponseStreamParticipants(intentInvocation);
+
+		const activeTools = new Set<string>();
+		let currentStatus = l10n.t('Initializing...');
+		const updateToolProgress = () => {
+			if (activeTools.size > 0) {
+				const toolNames = Array.from(activeTools).map(name => name.split('_').pop()).join(', ');
+				this.stream.progress(l10n.t('Working (calling {0})...', toolNames));
+			} else {
+				this.stream.progress(currentStatus);
+			}
+		};
+		updateToolProgress();
+
+		store.add(this._toolsService.onWillInvokeTool(e => {
+			if (e.chatRequestId === this.turn.id) {
+				activeTools.add(e.toolName);
+				updateToolProgress();
+			}
+		}));
+		store.add(this._toolsService.onDidInvokeTool(e => {
+			if (e.chatRequestId === this.turn.id) {
+				activeTools.delete(e.toolName);
+				updateToolProgress();
+			}
+		}));
+
 		const loop = this._loop = store.add(this._instantiationService.createInstance(
 			DefaultToolCallingLoop,
 			{
@@ -298,7 +445,7 @@ export class DefaultIntentRequestHandler {
 					? ToolCallLimitBehavior.Confirm : ToolCallLimitBehavior.Stop,
 				request: this.request,
 				documentContext: this.documentContext,
-				streamParticipants: this.makeResponseStreamParticipants(intentInvocation),
+				streamParticipants: participants,
 				temperature: this.handlerOptions.temperature ?? this.options.temperature,
 				location: this.location,
 				overrideRequestLocation: this.handlerOptions.overrideRequestLocation,
@@ -309,6 +456,16 @@ export class DefaultIntentRequestHandler {
 		));
 
 		store.add(Event.once(loop.onDidBuildPrompt)(this._sendInitialChatReferences, this));
+		store.add(loop.onDidBuildPrompt(({ promptTokenLength }) => {
+			currentStatus = l10n.t('Thinking...');
+			updateToolProgress();
+
+			const maxTokens = intentInvocation.endpoint.modelMaxPromptTokens;
+			const percentage = (promptTokenLength / maxTokens) * 100;
+			const formatTokens = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1).replace(/\.0$/, '')}K` : n.toString();
+			this._currentContextUsage = l10n.t('ctx: {0}%: {1}/{2}', percentage.toFixed(1), formatTokens(promptTokenLength), formatTokens(maxTokens));
+			this.updateStatusBar(this._currentContextUsage);
+		}));
 
 		// We need to wait for all response handlers to finish before
 		// we can dispose the store. This is because the telemetry machine
@@ -319,7 +476,18 @@ export class DefaultIntentRequestHandler {
 		//
 		// cc @lramos15
 		const responseHandlers: Promise<unknown>[] = [];
+		store.add(loop.onWillBuildPrompt(() => {
+			currentStatus = l10n.t('Building prompt...');
+			updateToolProgress();
+		}));
+		store.add(loop.onWillFetch(() => {
+			currentStatus = l10n.t('Generating response...');
+			updateToolProgress();
+		}));
 		store.add(loop.onDidReceiveResponse(res => {
+			currentStatus = l10n.t('Processing response...');
+			updateToolProgress();
+
 			const promise = this._onDidReceiveResponse(res);
 			responseHandlers.push(promise);
 			return promise;
@@ -341,6 +509,8 @@ export class DefaultIntentRequestHandler {
 			result.chatResult = this.resultWithMetadatas(result.chatResult);
 			return { ...result, lastRequestTelemetry: loop.telemetry };
 		} finally {
+			this._currentStatus = undefined;
+			this.updateStatusBar();
 			await Promise.allSettled(responseHandlers);
 			store.dispose();
 		}
